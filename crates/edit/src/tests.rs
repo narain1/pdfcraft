@@ -4473,3 +4473,176 @@ fn removing_marks_strips_wrappers_that_closed_open_state() {
     assert_eq!(remove_marks(&mut doc, &[0], MarkKind::Watermark).unwrap(), 1);
     assert_eq!(streams(&doc, 0), ["q 2 0 0 2 0 0 cm"]);
 }
+
+#[test]
+fn typed_placement_keeps_exact_objects_and_current_indexes_through_edits() {
+    let mut doc = fixture();
+    let page = page_list(&doc)[0].clone();
+    let source = contents(&mut doc, &page).unwrap();
+    let text = |label: &str| Content::Text(AddedText { text: label.into(), rect: [20.0, 100.0, 220.0, 140.0], ..AddedText::default() });
+    assert_eq!(add_content(&mut doc, 0, &text("Overlay A")).unwrap(), 0);
+    let a = list_added(&doc)[0].obj;
+    assert_eq!(add_content_with_placement(&mut doc, 0, &text("Underlay B"), Placement::Underlay).unwrap(), 0);
+    let b = list_added(&doc)[0].obj;
+    let mut image = Dict::new();
+    image.set(b"Type".to_vec(), Object::name("XObject"));
+    image.set(b"Subtype".to_vec(), Object::name("Image"));
+    image.set(b"Width".to_vec(), Object::Int(1));
+    image.set(b"Height".to_vec(), Object::Int(1));
+    image.set(b"ColorSpace".to_vec(), Object::name("DeviceRGB"));
+    image.set(b"BitsPerComponent".to_vec(), Object::Int(8));
+    let image = doc.add(Object::Stream(Stream::from_raw(image, vec![255, 0, 0])));
+    let c = Content::Image(AddedImage::new([30.0, 40.0, 80.0, 90.0], image));
+    assert_eq!(add_content_with_placement(&mut doc, 0, &c, Placement::Underlay).unwrap(), 0);
+    let c_ref = list_added(&doc)[0].obj;
+    assert_eq!(add_content_with_placement(&mut doc, 0, &text("Overlay D"), Placement::Overlay).unwrap(), 3);
+    let d = list_added(&doc)[3].obj;
+    let refs = |doc: &Document| list_added(doc).into_iter().filter(|a| a.page == 0).map(|a| a.obj).collect::<Vec<_>>();
+    assert_eq!(refs(&doc), [c_ref, b, a, d]);
+    let page = page_list(&doc)[0].clone();
+    let content_refs = contents(&mut doc, &page).unwrap();
+    assert_eq!(content_refs[0].as_ref(), Some(c_ref));
+    assert_eq!(content_refs[1].as_ref(), Some(b));
+    assert_eq!(content_refs.iter().filter(|entry| source.contains(entry)).count(), source.len());
+    assert!(streams(&doc, 0).iter().any(|s| s.contains("(Hi) Tj")));
+
+    let moved = Content::Image(AddedImage::new([40.0, 50.0, 90.0, 100.0], image));
+    update_content(&mut doc, 0, 0, &moved).unwrap();
+    update_content(&mut doc, 0, 3, &text("Updated D")).unwrap();
+    assert_eq!(refs(&doc), [c_ref, b, a, d], "replacement preserves exact stream and position");
+    let reopened = reopen(&doc);
+    assert_eq!(refs(&reopened), [c_ref, b, a, d], "incremental save preserves object refs");
+    assert_eq!(list_added(&reopened)[0].content, moved);
+    assert!(matches!(&list_added(&reopened)[3].content, Content::Text(t) if t.text == "Updated D"));
+    let full = Document::open(Arc::new(write_full(&doc, &SaveOptions::default()).unwrap())).unwrap();
+    let mut full_items = list_added(&full);
+    assert_eq!(full_items.len(), 4);
+    // Full rewrite renumbers image references; verify the referenced pixels before comparing
+    // the remaining typed values in drawing order. Incremental identity was checked above.
+    let Content::Image(full_image) = &mut full_items[0].content else { panic!() };
+    assert_eq!(stream_bytes(&full, &Object::Ref(full_image.image)).unwrap(), vec![255, 0, 0]);
+    full_image.image = image;
+    assert_eq!(full_items.iter().map(|a| &a.content).collect::<Vec<_>>(), list_added(&doc).iter().map(|a| &a.content).collect::<Vec<_>>());
+
+    delete_content(&mut doc, 0, 3).unwrap();
+    delete_content(&mut doc, 0, 0).unwrap();
+    assert_eq!(refs(&doc), [b, a]);
+    update_content(&mut doc, 0, 0, &text("Updated B")).unwrap();
+    assert_eq!(refs(&doc), [b, a]);
+    delete_content(&mut doc, 0, 0).unwrap();
+    delete_content(&mut doc, 0, 0).unwrap();
+    assert!(refs(&doc).is_empty());
+    assert!(streams(&doc, 0).iter().any(|s| s.contains("(Hi) Tj")));
+}
+
+#[test]
+fn typed_placement_default_overlay_is_byte_identical_and_marks_stay_separate() {
+    let original = fixture();
+    let mut legacy = original.clone();
+    let mut explicit = original.clone();
+    let text = Content::Text(AddedText { text: "Typed overlay".into(), rect: [20.0, 60.0, 220.0, 100.0], ..AddedText::default() });
+    for page in [0, 1, 2, 0] {
+        assert_eq!(
+            add_content(&mut legacy, page, &text).unwrap(),
+            add_content_with_placement(&mut explicit, page, &text, Placement::Overlay).unwrap()
+        );
+    }
+    assert_eq!(write_incremental(&legacy, &SaveOptions::default()).unwrap(), write_incremental(&explicit, &SaveOptions::default()).unwrap());
+    assert_eq!(write_full(&legacy, &SaveOptions::default()).unwrap(), write_full(&explicit, &SaveOptions::default()).unwrap());
+    assert_eq!(Placement::default(), Placement::Overlay);
+
+    let mut doc = original;
+    add_background(&mut doc, &[0], &Background::default(), false).unwrap();
+    add_watermark(&mut doc, &[0], &Watermark { text: "Prior mark".into(), behind: true, ..Watermark::default() }, false).unwrap();
+    add_content(&mut doc, 0, &text).unwrap();
+    let overlay = list_added(&doc)[0].obj;
+    add_content_with_placement(&mut doc, 0, &text, Placement::Underlay).unwrap();
+    let underlay = list_added(&doc)[0].obj;
+    assert_eq!(list_added(&doc).iter().map(|a| a.obj).collect::<Vec<_>>(), [underlay, overlay]);
+    assert_eq!(remove_marks(&mut doc, &[0], MarkKind::Background).unwrap(), 1);
+    assert_eq!(remove_marks(&mut doc, &[0], MarkKind::Watermark).unwrap(), 1);
+    assert!(marks_present(&doc).is_empty());
+    assert_eq!(list_added(&doc).iter().map(|a| a.obj).collect::<Vec<_>>(), [underlay, overlay]);
+    assert!(streams(&doc, 0).iter().any(|s| s.contains("(Hi) Tj")));
+    let reopened = reopen(&doc);
+    assert_eq!(list_added(&reopened).iter().map(|a| a.obj).collect::<Vec<_>>(), [underlay, overlay]);
+}
+
+#[test]
+fn typed_placement_handles_content_representations_without_replacing_originals() {
+    for mode in 0..5 {
+        let mut doc = fixture();
+        let p = page_list(&doc)[0].clone();
+        let bytes = b"q 0.2 0.4 0.6 rg 5 6 7 8 re f Q\n".to_vec();
+        let stream = Stream::from_raw(Dict::new(), bytes.clone());
+        let first = doc.add(Object::Stream(stream.clone()));
+        let second = doc.add(Object::Stream(stream.clone()));
+        let original = match mode {
+            0 => None,
+            1 => Some(Object::Ref(first)),
+            2 => Some(Object::Array(vec![Object::Ref(first), Object::Ref(second)])),
+            3 => Some(Object::Ref(doc.add(Object::Array(vec![Object::Ref(first), Object::Ref(second)])))),
+            _ => Some(Object::Stream(stream)),
+        };
+        doc.update_dict(p.obj, |d| match original {
+            Some(value) => d.set(b"Contents".to_vec(), value),
+            None => {
+                d.remove(b"Contents");
+            }
+        })
+        .unwrap();
+        let expected = match mode {
+            0 => 0,
+            2 | 3 => 2,
+            _ => 1,
+        };
+        let text = Content::Text(AddedText { text: "First underlay".into(), rect: [10.0, 20.0, 200.0, 50.0], ..AddedText::default() });
+        assert_eq!(add_content_with_placement(&mut doc, 0, &text, Placement::Underlay).unwrap(), 0);
+        let added = list_added(&doc)[0].obj;
+        let page = page_list(&doc)[0].clone();
+        let list = contents(&mut doc, &page).unwrap();
+        assert_eq!(list.len(), expected + 1, "mode {mode}");
+        assert_eq!(list[0].as_ref(), Some(added));
+        for entry in &list[1..] {
+            assert_eq!(stream_bytes(&doc, entry).unwrap(), bytes);
+        }
+        if (1..=3).contains(&mode) {
+            assert_eq!(list[1].as_ref(), Some(first));
+        }
+        if mode == 2 || mode == 3 {
+            assert_eq!(list[2].as_ref(), Some(second));
+        }
+        assert_eq!(streams(&reopen(&doc), 0), streams(&doc, 0));
+    }
+}
+
+#[test]
+fn typed_placement_refusals_preserve_source_and_resource_collision_scope_is_unchanged() {
+    let mut doc = fixture();
+    let text = Content::Text(AddedText { text: "Valid".into(), rect: [10.0, 20.0, 200.0, 50.0], ..AddedText::default() });
+    let before = write_incremental(&doc, &SaveOptions::default()).unwrap();
+    assert_eq!(add_content_with_placement(&mut doc, usize::MAX, &text, Placement::Underlay), Err(EditError::NoSuchPage(usize::MAX)));
+    let empty = Content::Text(AddedText { text: String::new(), rect: [10.0, 20.0, 200.0, 50.0], ..AddedText::default() });
+    assert!(add_content_with_placement(&mut doc, 0, &empty, Placement::Underlay).is_err());
+    assert!(update_content(&mut doc, 0, 0, &text).is_err());
+    assert!(delete_content(&mut doc, 0, 0).is_err());
+    assert_eq!(write_incremental(&doc, &SaveOptions::default()).unwrap(), before);
+    // Existing fixed-font naming can replace an unrelated binding. Placement does not fix
+    // this native limitation; adapters must retain their staged preservation/refusal guard.
+    let p = page_list(&doc)[0].clone();
+    let inherited = doc.resolve(p.dict.get(b"Resources").unwrap());
+    let mut res = inherited.as_dict().unwrap().clone();
+    let mut fonts = doc.resolve(res.get(b"Font").unwrap()).as_dict().unwrap().clone();
+    let original_font = fonts.get(b"F1").unwrap().clone();
+    fonts.set(b"PCFHelvetica".to_vec(), original_font.clone());
+    res.set(b"Font".to_vec(), Object::Dict(fonts));
+    doc.update_dict(p.obj, |d| d.set(b"Resources".to_vec(), Object::Dict(res))).unwrap();
+    let parent_before = doc.get(pdfcraft_cos::ObjRef::new(2, 0));
+    add_content_with_placement(&mut doc, 0, &text, Placement::Underlay).unwrap();
+    let p = page_list(&doc)[0].clone();
+    let resources = doc.resolve(p.dict.get(b"Resources").unwrap());
+    let fonts = doc.resolve(resources.as_dict().unwrap().get(b"Font").unwrap());
+    assert_eq!(fonts.as_dict().unwrap().get(b"F1"), Some(&original_font));
+    assert_ne!(fonts.as_dict().unwrap().get(b"PCFHelvetica"), Some(&original_font));
+    assert!(Arc::ptr_eq(&parent_before, &doc.get(pdfcraft_cos::ObjRef::new(2, 0))), "parent resources remain shared and unmodified");
+}

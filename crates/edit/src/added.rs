@@ -1026,8 +1026,20 @@ fn validate(c: &Content) -> Result<(), EditError> {
     Ok(())
 }
 
+/// Placement of a newly added typed text or image item relative to existing page content.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Placement {
+    /// Append after existing page content, isolating its graphics state as necessary.
+    #[default]
+    Overlay,
+    /// Prepend before existing page content and prior typed underlays. As with PdfCraft's own
+    /// behind-content, it goes after any background marks and before watermark marks.
+    /// Adding A then B produces drawing order B, A, original; A paints above B.
+    Underlay,
+}
+
 /// Write an item's stream (new, or replacing `obj`) and make its resources available to the page.
-fn write(doc: &mut Document, page: usize, c: &Content, obj: Option<ObjRef>) -> Result<ObjRef, EditError> {
+fn write(doc: &mut Document, page: usize, c: &Content, obj: Option<ObjRef>, placement: Placement) -> Result<ObjRef, EditError> {
     validate(c)?;
     let all = page_list(doc);
     check(&[page], all.len())?;
@@ -1064,11 +1076,9 @@ fn write(doc: &mut Document, page: usize, c: &Content, obj: Option<ObjRef>) -> R
             Ok(r)
         }
         None => {
-            // place_tagged appends a new stream; recover its reference.
+            // Keep the exact new reference: prepending must not replace an existing last stream.
             let p = page_list(doc).swap_remove(page);
-            place_tagged(doc, &p, TAG, content.clone(), false)?;
-            let p = page_list(doc).swap_remove(page);
-            let r = contents(doc, &p)?.last().and_then(Object::as_ref).ok_or_else(|| EditError::Invalid("could not add the content".into()))?;
+            let r = place_tagged(doc, &p, TAG, content, placement == Placement::Underlay)?;
             doc.set(r, Object::Stream(stream));
             Ok(r)
         }
@@ -1082,8 +1092,24 @@ pub fn list_added(doc: &Document) -> Vec<Added> {
 
 /// Add an item to a page (0-based). Returns its index among the page's added items.
 pub fn add_content(doc: &mut Document, page: usize, c: &Content) -> Result<usize, EditError> {
-    write(doc, page, c, None)?;
-    Ok(list_added(doc).iter().filter(|a| a.page == page).count() - 1)
+    add_content_with_placement(doc, page, c, Placement::Overlay)
+}
+
+/// Add typed text or an image before or after existing page content.
+///
+/// Returns the item's current index among that page's added items in drawing order.
+/// Underlays are prepended: adding A then B yields B, A, original, and shifts the indexes
+/// of prior items. Refresh indexes with [`list_added`] before updating or deleting them.
+/// Updates preserve the existing stream's position. An opaque original background can
+/// completely hide an underlay. Resource naming and collision behavior are unchanged.
+/// This does not expose underlay placement for arbitrary raw content streams.
+pub fn add_content_with_placement(doc: &mut Document, page: usize, c: &Content, placement: Placement) -> Result<usize, EditError> {
+    let reference = write(doc, page, c, None, placement)?;
+    list_added(doc)
+        .iter()
+        .filter(|a| a.page == page)
+        .position(|a| a.obj == reference)
+        .ok_or_else(|| EditError::Invalid("could not find the added content".into()))
 }
 
 fn find(doc: &Document, page: usize, index: usize) -> Result<Added, EditError> {
@@ -1100,7 +1126,7 @@ pub fn update_content(doc: &mut Document, page: usize, index: usize, c: &Content
     if std::mem::discriminant(&a.content) != std::mem::discriminant(c) {
         return Err(EditError::Invalid("an item can't change between text and image".into()));
     }
-    write(doc, page, c, Some(a.obj))?;
+    write(doc, page, c, Some(a.obj), Placement::Overlay)?;
     Ok(())
 }
 
